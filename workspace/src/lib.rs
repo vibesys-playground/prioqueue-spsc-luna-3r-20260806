@@ -3,6 +3,8 @@
 mod ffi;
 
 use std::cell::UnsafeCell;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -54,6 +56,40 @@ struct QueueState {
     slots: Vec<Slot>,
     // Search-only occupancy metadata. Slot state remains authoritative.
     occupied: Vec<AtomicUsize>,
+    // In the exact one-producer/one-consumer configuration these positions
+    // describe a monotonic ring window.  They are only a search hint: slot
+    // state remains authoritative and the bitmap path is retained as the
+    // recovery path for holes and wrapped reuse.
+    ring_mode: AtomicU8,
+    producer_position: AtomicUsize,
+    consumer_position: AtomicUsize,
+    published_indices: Vec<AtomicUsize>,
+    published_write: AtomicUsize,
+    published_read: AtomicUsize,
+    free_indices: Vec<AtomicUsize>,
+    free_write: AtomicUsize,
+    free_read: AtomicUsize,
+}
+
+#[derive(Eq, PartialEq)]
+struct HeapItem {
+    priority: u64,
+    index: usize,
+}
+
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .priority
+            .cmp(&self.priority)
+            .then_with(|| other.index.cmp(&self.index))
+    }
+}
+
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
 }
 
 pub struct Queue {
@@ -89,6 +125,20 @@ impl Queue {
         for _ in 0..word_count {
             occupied.push(AtomicUsize::new(0));
         }
+        let mut published_indices = Vec::new();
+        published_indices
+            .try_reserve_exact(capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for _ in 0..capacity {
+            published_indices.push(AtomicUsize::new(0));
+        }
+        let mut free_indices = Vec::new();
+        free_indices
+            .try_reserve_exact(capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for index in 0..capacity {
+            free_indices.push(AtomicUsize::new(index));
+        }
         Ok(Self {
             producer_count,
             consumer_count,
@@ -96,6 +146,19 @@ impl Queue {
                 max_value_size,
                 slots,
                 occupied,
+                ring_mode: AtomicU8::new(if producer_count == 1 && consumer_count == 1 {
+                    2
+                } else {
+                    0
+                }),
+                producer_position: AtomicUsize::new(0),
+                consumer_position: AtomicUsize::new(0),
+                published_indices,
+                published_write: AtomicUsize::new(0),
+                published_read: AtomicUsize::new(0),
+                free_indices,
+                free_write: AtomicUsize::new(capacity),
+                free_read: AtomicUsize::new(0),
             }),
         })
     }
@@ -114,6 +177,7 @@ impl Queue {
             .then(|| Consumer {
                 state: Arc::clone(&self.state),
                 search_hint: AtomicUsize::new(0),
+                heap: UnsafeCell::new(BinaryHeap::new()),
             })
             .ok_or(STATUS_INVALID)
     }
@@ -128,6 +192,18 @@ impl Producer {
     fn try_enqueue(&self, priority: u64, data: &[u8]) -> u32 {
         if data.len() > self.state.max_value_size {
             return STATUS_INVALID;
+        }
+
+        if self.state.ring_mode.load(Ordering::Acquire) == 2 {
+            if let Some(status) = self.try_enqueue_exchange(priority, data) {
+                return status;
+            }
+        }
+
+        if self.state.ring_mode.load(Ordering::Acquire) == 1 {
+            if let Some(status) = self.try_enqueue_ring(priority, data) {
+                return status;
+            }
         }
 
         let capacity = self.state.slots.len();
@@ -163,6 +239,78 @@ impl Producer {
     }
 
     #[inline]
+    fn try_enqueue_exchange(&self, priority: u64, data: &[u8]) -> Option<u32> {
+        let read = self.state.free_read.load(Ordering::Acquire);
+        let write = self.state.free_write.load(Ordering::Acquire);
+        if read == write {
+            return Some(STATUS_FULL);
+        }
+        let free_slot = &self.state.free_indices[read % self.state.slots.len()];
+        let index = free_slot.load(Ordering::Relaxed);
+        let slot = &self.state.slots[index];
+        if slot
+            .state
+            .compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            self.state.ring_mode.store(0, Ordering::Release);
+            return None;
+        }
+        unsafe {
+            (&mut *slot.value.get())[..data.len()].copy_from_slice(data);
+        }
+        slot.priority.store(priority, Ordering::Relaxed);
+        slot.length.store(data.len(), Ordering::Relaxed);
+        self.state.occupied[index / WORD_BITS].fetch_or(
+            1usize << (index % WORD_BITS),
+            Ordering::Release,
+        );
+        slot.state.store(SLOT_PUBLISHED, Ordering::Release);
+        let published_write = self.state.published_write.load(Ordering::Relaxed);
+        self.state.published_indices[published_write % self.state.slots.len()]
+            .store(index, Ordering::Relaxed);
+        self.state
+            .published_write
+            .store(published_write.wrapping_add(1), Ordering::Release);
+        self.state
+            .free_read
+            .store(read.wrapping_add(1), Ordering::Release);
+        Some(STATUS_OK)
+    }
+
+    #[inline]
+    fn try_enqueue_ring(&self, priority: u64, data: &[u8]) -> Option<u32> {
+        let position = self.state.producer_position.load(Ordering::Relaxed);
+        let index = position % self.state.slots.len();
+        let slot = &self.state.slots[index];
+        if slot
+            .state
+            .compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            // The next ring cell is still live.  Reusing an older hole would
+            // invalidate the compact ring window, so switch to the general
+            // path before publishing anything outside it.
+            self.state.ring_mode.store(0, Ordering::Release);
+            return None;
+        }
+        unsafe {
+            (&mut *slot.value.get())[..data.len()].copy_from_slice(data);
+        }
+        slot.priority.store(priority, Ordering::Relaxed);
+        slot.length.store(data.len(), Ordering::Relaxed);
+        self.state.occupied[index / WORD_BITS].fetch_or(
+            1usize << (index % WORD_BITS),
+            Ordering::Release,
+        );
+        slot.state.store(SLOT_PUBLISHED, Ordering::Release);
+        self.state
+            .producer_position
+            .store(position.wrapping_add(1), Ordering::Release);
+        Some(STATUS_OK)
+    }
+
+    #[inline]
     fn claim_and_publish(&self, index: usize, priority: u64, data: &[u8]) -> bool {
         let slot = &self.state.slots[index];
         if slot
@@ -191,10 +339,168 @@ impl Producer {
 pub struct Consumer {
     state: Arc<QueueState>,
     search_hint: AtomicUsize,
+    heap: UnsafeCell<BinaryHeap<HeapItem>>,
 }
+
+unsafe impl Sync for Consumer {}
 
 impl Consumer {
     fn try_dequeue(&self, output: &mut [u8]) -> Result<usize, u32> {
+        if self.state.ring_mode.load(Ordering::Acquire) == 2 {
+            if let Some(result) = self.try_dequeue_exchange(output) {
+                return result;
+            }
+        }
+        if self.state.ring_mode.load(Ordering::Acquire) != 0 {
+            if let Some(result) = self.try_dequeue_ring(output) {
+                return result;
+            }
+        }
+        self.try_dequeue_general(output)
+    }
+
+    fn try_dequeue_exchange(&self, output: &mut [u8]) -> Option<Result<usize, u32>> {
+        let capacity = self.state.slots.len();
+        let mut read = self.state.published_read.load(Ordering::Relaxed);
+        let write = self.state.published_write.load(Ordering::Acquire);
+        let heap = unsafe { &mut *self.heap.get() };
+        while read != write {
+            let index = self.state.published_indices[read % capacity].load(Ordering::Relaxed);
+            let slot = &self.state.slots[index];
+            if slot.state.load(Ordering::Acquire) != SLOT_PUBLISHED {
+                self.state.ring_mode.store(0, Ordering::Release);
+                return None;
+            }
+            heap.push(HeapItem {
+                priority: slot.priority.load(Ordering::Relaxed),
+                index,
+            });
+            read = read.wrapping_add(1);
+        }
+        self.state.published_read.store(read, Ordering::Release);
+
+        let Some(item) = heap.peek() else {
+            return Some(Err(STATUS_EMPTY));
+        };
+        let slot = &self.state.slots[item.index];
+        let length = slot.length.load(Ordering::Relaxed);
+        if length > output.len() {
+            return Some(Err(STATUS_INVALID));
+        }
+        if slot
+            .state
+            .compare_exchange(
+                SLOT_PUBLISHED,
+                SLOT_CLAIMED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            self.state.ring_mode.store(0, Ordering::Release);
+            return None;
+        }
+        let item = heap.pop().expect("heap item was peeked");
+        unsafe {
+            output[..length].copy_from_slice(&(&*slot.value.get())[..length]);
+        }
+        self.state.occupied[item.index / WORD_BITS].fetch_and(
+            !(1usize << (item.index % WORD_BITS)),
+            Ordering::AcqRel,
+        );
+        slot.state.store(SLOT_EMPTY, Ordering::Release);
+        let free_write = self.state.free_write.load(Ordering::Relaxed);
+        self.state.free_indices[free_write % capacity].store(item.index, Ordering::Relaxed);
+        self.state
+            .free_write
+            .store(free_write.wrapping_add(1), Ordering::Release);
+        Some(Ok(length))
+    }
+
+    // The common SPSC path scans the current logical window, rather than all
+    // capacity slots.  A minimum still requires comparing every live item;
+    // this is the necessary priority-ordering work, but the window is usually
+    // much smaller than capacity in the try-style benchmark.
+    fn try_dequeue_ring(&self, output: &mut [u8]) -> Option<Result<usize, u32>> {
+        let capacity = self.state.slots.len();
+        let mut head = self.state.consumer_position.load(Ordering::Relaxed);
+        let tail = self.state.producer_position.load(Ordering::Acquire);
+        let span = tail.wrapping_sub(head);
+        if span > capacity {
+            self.state.ring_mode.store(0, Ordering::Release);
+            return None;
+        }
+
+        let mut best_index = None;
+        let mut best_priority = u64::MAX;
+        for offset in 0..span {
+            let index = head.wrapping_add(offset) % capacity;
+            let slot = &self.state.slots[index];
+            if slot.state.load(Ordering::Acquire) == SLOT_PUBLISHED {
+                let priority = slot.priority.load(Ordering::Relaxed);
+                if best_index.is_none() || priority < best_priority {
+                    best_priority = priority;
+                    best_index = Some(index);
+                }
+            }
+        }
+
+        let Some(index) = best_index else {
+            // If the producer has switched to the general path, inspect its
+            // bitmap before reporting empty; otherwise this is a real empty
+            // ring (or a window containing only reclaimed holes).
+            if self.state.ring_mode.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+            while head != tail {
+                let index = head % capacity;
+                if self.state.slots[index].state.load(Ordering::Acquire) != SLOT_EMPTY {
+                    break;
+                }
+                head = head.wrapping_add(1);
+            }
+            self.state.consumer_position.store(head, Ordering::Release);
+            return Some(Err(STATUS_EMPTY));
+        };
+
+        let slot = &self.state.slots[index];
+        let length = slot.length.load(Ordering::Relaxed);
+        if length > output.len() {
+            return Some(Err(STATUS_INVALID));
+        }
+        if slot
+            .state
+            .compare_exchange(
+                SLOT_PUBLISHED,
+                SLOT_CLAIMED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Some(Err(STATUS_EMPTY));
+        }
+        unsafe {
+            output[..length].copy_from_slice(&(&*slot.value.get())[..length]);
+        }
+        self.state.occupied[index / WORD_BITS].fetch_and(
+            !(1usize << (index % WORD_BITS)),
+            Ordering::AcqRel,
+        );
+        slot.state.store(SLOT_EMPTY, Ordering::Release);
+        head = self.state.consumer_position.load(Ordering::Relaxed);
+        while head != tail {
+            let head_index = head % capacity;
+            if self.state.slots[head_index].state.load(Ordering::Acquire) != SLOT_EMPTY {
+                break;
+            }
+            head = head.wrapping_add(1);
+        }
+        self.state.consumer_position.store(head, Ordering::Release);
+        Some(Ok(length))
+    }
+
+    fn try_dequeue_general(&self, output: &mut [u8]) -> Result<usize, u32> {
         loop {
             let mut best: Option<&Slot> = None;
             let mut best_priority = u64::MAX;

@@ -175,4 +175,14 @@ The required shared library exists and exports the expected ABI. Rust release te
 
 ### Feedback
 Optimize the SPSC hot path so enqueue and dequeue do not scan the full capacity on every operation; maintain a cheap producer/consumer position or other bounded fast-path metadata while preserving priority ordering and undersized-dequeue semantics. Re-run the trusted benchmark and ensure total_ops_per_sec exceeds 620,688 consistently. The Go evaluator tests were unavailable in this environment due to the installed Go toolchain/dependency setup.
+## Round 2 — Implementer result (attempt 2)
+
+- Reworked the exact SPSC fast path into bounded free-slot and publication index exchanges. The consumer drains published indices into a private binary min-heap and returns the lowest numeric priority without scanning queue capacity.
+- Preserved slot ownership atomics, bitmap metadata, copying behavior, capacity accounting, ABI statuses, and undersized-dequeue non-destructive behavior. Metadata/state inconsistencies fall back to the authoritative scan path; non-SPSC handles use that path directly.
+- Verification: `cargo test --locked` passed (4 tests), the release shared library rebuilt, native probes passed for standard and non-word-aligned values, and repeated trusted-style SPSC runs reported 2,313,249 to 4,168,802 total_ops_per_sec, all above the 620,688 baseline. `cargo fmt --check` was unavailable because rustfmt is not installed. Go evaluator tests remain unavailable due to the incomplete Go toolchain.
+## Round 2 — Implementer (attempt 2)
+- **expected_behavior**: SPSC operations avoid full-capacity scans while returning minimum priorities exactly once; fallback paths preserve correctness for holes, wrapping, and metadata races.
+
+### Summary
+Implemented an exact-SPSC free-slot/publication index path with a consumer-local binary min-heap, preserving ABI, ownership, capacity, copying, priority ordering, and undersized-dequeue semantics. Tests and probes pass; benchmarks reached 2.31–4.17M ops/s. Updated progress.md.
 
