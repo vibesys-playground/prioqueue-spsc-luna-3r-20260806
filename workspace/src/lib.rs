@@ -2,9 +2,9 @@
 
 mod ffi;
 
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::sync::{Arc, Mutex};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const ABI_VERSION: u32 = 1;
 const STATUS_OK: u32 = 0;
@@ -13,44 +13,44 @@ const STATUS_EMPTY: u32 = 2;
 const STATUS_INVALID: u32 = 3;
 const STATUS_INTERNAL_ERROR: u32 = 4;
 
-struct Entry {
-    priority: u64,
-    sequence: u64,
-    value: Vec<u8>,
+const SLOT_EMPTY: u8 = 0;
+const SLOT_WRITING: u8 = 1;
+const SLOT_PUBLISHED: u8 = 2;
+const SLOT_CLAIMED: u8 = 3;
+
+struct Slot {
+    state: AtomicU8,
+    priority: AtomicU64,
+    length: AtomicUsize,
+    value: UnsafeCell<Vec<u8>>,
 }
 
-impl PartialEq for Entry {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority && self.sequence == other.sequence
+// A slot's Vec is accessed by only the owner of its current state. The state
+// release/acquire transitions publish all value-buffer accesses between the
+// producer and consumer.
+unsafe impl Sync for Slot {}
+
+impl Slot {
+    fn new(max_value_size: usize) -> Result<Self, u32> {
+        let mut value = Vec::new();
+        value
+            .try_reserve_exact(max_value_size)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        // The buffer is deliberately allocated once. Bytes beyond length are
+        // never read, so they need not be initialized.
+        unsafe { value.set_len(max_value_size) };
+        Ok(Self {
+            state: AtomicU8::new(SLOT_EMPTY),
+            priority: AtomicU64::new(0),
+            length: AtomicUsize::new(0),
+            value: UnsafeCell::new(value),
+        })
     }
-}
-
-impl Eq for Entry {}
-
-impl PartialOrd for Entry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Entry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-
-struct Values {
-    next_sequence: u64,
-    heap: BinaryHeap<Entry>,
 }
 
 struct QueueState {
-    capacity: usize,
     max_value_size: usize,
-    values: Mutex<Values>,
+    slots: Vec<Slot>,
 }
 
 pub struct Queue {
@@ -71,19 +71,19 @@ impl Queue {
         }
         let capacity = usize::try_from(capacity).map_err(|_| STATUS_INVALID)?;
         let max_value_size = usize::try_from(max_value_size).map_err(|_| STATUS_INVALID)?;
-        let mut heap = BinaryHeap::new();
-        heap.try_reserve_exact(capacity)
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(capacity)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for _ in 0..capacity {
+            slots.push(Slot::new(max_value_size)?);
+        }
         Ok(Self {
             producer_count,
             consumer_count,
             state: Arc::new(QueueState {
-                capacity,
                 max_value_size,
-                values: Mutex::new(Values {
-                    next_sequence: 0,
-                    heap,
-                }),
+                slots,
             }),
         })
     }
@@ -114,25 +114,30 @@ impl Producer {
         if data.len() > self.state.max_value_size {
             return STATUS_INVALID;
         }
-        let Ok(mut values) = self.state.values.lock() else {
-            return STATUS_INTERNAL_ERROR;
-        };
-        if values.heap.len() == self.state.capacity {
-            return STATUS_FULL;
+
+        // In the SPSC workload the producer owns the search and claims one
+        // free slot without ever waiting for the consumer.
+        for slot in &self.state.slots {
+            if slot
+                .state
+                .compare_exchange(
+                    SLOT_EMPTY,
+                    SLOT_WRITING,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                unsafe {
+                    (&mut *slot.value.get())[..data.len()].copy_from_slice(data);
+                }
+                slot.priority.store(priority, Ordering::Relaxed);
+                slot.length.store(data.len(), Ordering::Relaxed);
+                slot.state.store(SLOT_PUBLISHED, Ordering::Release);
+                return STATUS_OK;
+            }
         }
-        let mut value = Vec::new();
-        if value.try_reserve_exact(data.len()).is_err() {
-            return STATUS_INTERNAL_ERROR;
-        }
-        value.extend_from_slice(data);
-        let sequence = values.next_sequence;
-        values.next_sequence = values.next_sequence.wrapping_add(1);
-        values.heap.push(Entry {
-            priority,
-            sequence,
-            value,
-        });
-        STATUS_OK
+        STATUS_FULL
     }
 }
 
@@ -142,19 +147,47 @@ pub struct Consumer {
 
 impl Consumer {
     fn try_dequeue(&self, output: &mut [u8]) -> Result<usize, u32> {
-        let Ok(mut values) = self.state.values.lock() else {
-            return Err(STATUS_INTERNAL_ERROR);
-        };
-        let Some(entry) = values.heap.peek() else {
-            return Err(STATUS_EMPTY);
-        };
-        if entry.value.len() > output.len() {
-            return Err(STATUS_INVALID);
+        loop {
+            let mut best: Option<&Slot> = None;
+            let mut best_priority = u64::MAX;
+            for slot in &self.state.slots {
+                if slot.state.load(Ordering::Acquire) == SLOT_PUBLISHED {
+                    let priority = slot.priority.load(Ordering::Relaxed);
+                    if best.is_none() || priority < best_priority {
+                        best = Some(slot);
+                        best_priority = priority;
+                    }
+                }
+            }
+            let Some(slot) = best else {
+                return Err(STATUS_EMPTY);
+            };
+            let length = slot.length.load(Ordering::Relaxed);
+            // Do not claim an undersized item: this preserves both the item
+            // and all caller-owned output state exactly as required by ABI.
+            if length > output.len() {
+                return Err(STATUS_INVALID);
+            }
+            if slot
+                .state
+                .compare_exchange(
+                    SLOT_PUBLISHED,
+                    SLOT_CLAIMED,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                // This is only relevant if extra consumer handles are used;
+                // retrying is finite, non-blocking progress for the caller.
+                continue;
+            }
+            unsafe {
+                output[..length].copy_from_slice(&(&*slot.value.get())[..length]);
+            }
+            slot.state.store(SLOT_EMPTY, Ordering::Release);
+            return Ok(length);
         }
-        output[..entry.value.len()].copy_from_slice(&entry.value);
-        let length = entry.value.len();
-        values.heap.pop();
-        Ok(length)
     }
 }
 
@@ -178,5 +211,21 @@ mod tests {
             assert_eq!(&output[..expected.len()], expected);
         }
         assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+    }
+
+    #[test]
+    fn undersized_dequeue_keeps_item_and_output_unchanged() {
+        let queue = Queue::new(1, 8, 1, 1).unwrap();
+        let producer = queue.producer(0).unwrap();
+        let consumer = queue.consumer(0).unwrap();
+        assert_eq!(producer.try_enqueue(1, b"payload"), STATUS_OK);
+
+        let mut output = [0xA5_u8; 3];
+        assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_INVALID));
+        assert_eq!(output, [0xA5; 3]);
+
+        let mut full_output = [0_u8; 8];
+        assert_eq!(consumer.try_dequeue(&mut full_output), Ok(7));
+        assert_eq!(&full_output[..7], b"payload");
     }
 }
