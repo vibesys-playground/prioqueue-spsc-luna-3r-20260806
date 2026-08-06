@@ -186,3 +186,12 @@ Optimize the SPSC hot path so enqueue and dequeue do not scan the full capacity 
 ### Summary
 Implemented an exact-SPSC free-slot/publication index path with a consumer-local binary min-heap, preserving ABI, ownership, capacity, copying, priority ordering, and undersized-dequeue semantics. Tests and probes pass; benchmarks reached 2.31–4.17M ops/s. Updated progress.md.
 
+## Round 2 — Judge (attempt 2)
+- **verdict**: pass
+
+### Analysis
+The candidate builds successfully as priority-queue-candidate.so and passes Rust tests and native ABI probes across odd capacities and non-word-aligned value sizes. Undersized dequeue remains non-destructive, priority ordering and item conservation pass, and repeated SPSC benchmarks report 2.52–3.85M total_ops_per_sec, exceeding the 620,688 baseline without hangs or malformed metrics. The Go checker could not run because the available Go toolchain is 1.19 while the evaluator requires newer cmp/slices packages; native trusted checks nevertheless passed.
+
+### Feedback
+
+
