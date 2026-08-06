@@ -107,3 +107,63 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 
+## Round 2 — Orchestrator (pre-round)
+- **need_profile**: False
+- **profile_focus**: 
+- **reasoning**: Profiling is unnecessary because code inspection clearly identifies the dominant cost: every enqueue and dequeue scans all capacity slots. The next optimization direction—reducing full-capacity scans while preserving priority ordering—is evident, and the recent benchmark is sufficient to proceed.
+
+## Round 2 plan
+
+- Active Major: Priority-selection specialization (round 2).
+- Task: Optimize the slot-selection hot paths in `src/lib.rs` for the trusted
+  SPSC workload. Add producer and consumer search hints/cursors (or an
+  equivalent metadata layout) so enqueue and minimum-priority dequeue avoid
+  restarting a full-capacity scan on every operation, while retaining a
+  correctness-preserving fallback whenever wrapped ranges, holes, concurrent
+  publication, or arbitrary priorities require broader inspection. Keep all
+  slot ownership atomics, copying semantics, capacity behavior, and ABI
+  statuses unchanged. Do not specialize by benchmark constants or bypass
+  priority comparison.
+- Pass criteria: Accuracy, ABI, and benchmark sanity pass; every dequeue still
+  returns the lowest numeric priority among queued items, every successful item
+  is returned exactly once, and invalid undersized dequeue remains
+  non-destructive. The trusted end-to-end SPSC benchmark reports valid
+  `total_ops_per_sec` and demonstrates an improvement over the round-1
+  620688-ops/s baseline (without hangs, crashes, or malformed statuses).
+- Reasoning: The lock-free representation removed mutex contention, but both
+  operations still inspect all capacity slots. Search locality and reusable
+  occupancy metadata are the next direct lever for reducing unavoidable scan
+  overhead without changing the copying ABI.
+## Round 2 — Orchestrator (plan)
+- **reasoning**: The lock-free baseline passed correctness but still scans every capacity slot on both operations. Search locality and reusable occupancy metadata are the next direct performance lever while preserving the copying ABI.
+
+### Task
+Optimize the slot-selection hot paths in src/lib.rs for the trusted SPSC workload. Add producer and consumer search hints/cursors or equivalent occupancy metadata so enqueue and minimum-priority dequeue avoid restarting full-capacity scans, with correctness-preserving fallback for holes, wrapping, concurrent publication, and arbitrary priorities. Preserve all ABI statuses, ownership atomics, copying semantics, and capacity behavior; do not specialize by benchmark constants or bypass priority comparison.
+
+### Pass criteria
+Accuracy, ABI, and benchmark sanity checks pass. Dequeue always returns the lowest numeric priority, successful items are returned exactly once, and undersized dequeue remains non-destructive. The trusted end-to-end SPSC benchmark reports valid total_ops_per_sec and improves over the round-1 baseline of 620688 ops/s without hangs, crashes, or malformed statuses.
+
+## Round 2 — Implementer result
+
+- Added an atomic occupancy bitmap to the preallocated slot state and a
+  per-handle search cursor. Enqueue now searches bitmap words for likely free
+  slots, and minimum-priority dequeue searches only occupied bitmap entries in
+  the common path, with wrapping and partial-word capacity handling.
+- Kept per-slot ownership state authoritative. Enqueue falls back to a full
+  state scan when bitmap metadata lags; dequeue falls back when bitmap entries
+  are holes or publication races are observed. Copying, priority comparison,
+  ABI statuses, capacity checks, and undersized non-destructive dequeue remain
+  unchanged.
+- Added concurrent consumer conservation regressions, including a short
+  output consumer racing a full output consumer.
+- Verification: `cargo test --locked` passed (4 tests); release shared library
+  rebuilt; repeated native multi-handle probes passed; a trusted-style SPSC
+  benchmark reached 935169.702390 total_ops_per_sec in a 2-second sanity run,
+  above the round-1 baseline of 620687.981394. The Go evaluator remains
+  unavailable because this environment's Go binary has no configured GOROOT.
+## Round 2 — Implementer (attempt 1)
+- **expected_behavior**: Priority dequeue remains correct and non-destructive for undersized output; ABI and capacity semantics are preserved. Benchmark reached 935169.702390 ops/s in a sanity run.
+
+### Summary
+Added atomic occupancy bitmap and producer/consumer search cursors with correctness-preserving full-scan fallbacks. Added concurrency regressions and verified release build, probes, and tests.
+

@@ -17,6 +17,7 @@ const SLOT_EMPTY: u8 = 0;
 const SLOT_WRITING: u8 = 1;
 const SLOT_PUBLISHED: u8 = 2;
 const SLOT_CLAIMED: u8 = 3;
+const WORD_BITS: usize = usize::BITS as usize;
 
 struct Slot {
     state: AtomicU8,
@@ -51,6 +52,8 @@ impl Slot {
 struct QueueState {
     max_value_size: usize,
     slots: Vec<Slot>,
+    // Search-only occupancy metadata. Slot state remains authoritative.
+    occupied: Vec<AtomicUsize>,
 }
 
 pub struct Queue {
@@ -78,12 +81,21 @@ impl Queue {
         for _ in 0..capacity {
             slots.push(Slot::new(max_value_size)?);
         }
+        let word_count = capacity.div_ceil(WORD_BITS);
+        let mut occupied = Vec::new();
+        occupied
+            .try_reserve_exact(word_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for _ in 0..word_count {
+            occupied.push(AtomicUsize::new(0));
+        }
         Ok(Self {
             producer_count,
             consumer_count,
             state: Arc::new(QueueState {
                 max_value_size,
                 slots,
+                occupied,
             }),
         })
     }
@@ -92,6 +104,7 @@ impl Queue {
         (id < self.producer_count)
             .then(|| Producer {
                 state: Arc::clone(&self.state),
+                search_hint: AtomicUsize::new(0),
             })
             .ok_or(STATUS_INVALID)
     }
@@ -100,6 +113,7 @@ impl Queue {
         (id < self.consumer_count)
             .then(|| Consumer {
                 state: Arc::clone(&self.state),
+                search_hint: AtomicUsize::new(0),
             })
             .ok_or(STATUS_INVALID)
     }
@@ -107,6 +121,7 @@ impl Queue {
 
 pub struct Producer {
     state: Arc<QueueState>,
+    search_hint: AtomicUsize,
 }
 
 impl Producer {
@@ -115,34 +130,67 @@ impl Producer {
             return STATUS_INVALID;
         }
 
-        // In the SPSC workload the producer owns the search and claims one
-        // free slot without ever waiting for the consumer.
-        for slot in &self.state.slots {
-            if slot
-                .state
-                .compare_exchange(
-                    SLOT_EMPTY,
-                    SLOT_WRITING,
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                unsafe {
-                    (&mut *slot.value.get())[..data.len()].copy_from_slice(data);
+        let capacity = self.state.slots.len();
+        let start = self.search_hint.load(Ordering::Relaxed) % capacity;
+        let start_word = start / WORD_BITS;
+
+        // In SPSC, the next free slot is normally near the previous one.
+        // Search bitmap words first, wrapping at the end of the ring.
+        for word_offset in 0..self.state.occupied.len() {
+            let word_index = (start_word + word_offset) % self.state.occupied.len();
+            let valid = valid_word_mask(word_index, capacity);
+            let mut free = !self.state.occupied[word_index].load(Ordering::Acquire) & valid;
+            while free != 0 {
+                let bit = free.trailing_zeros() as usize;
+                let index = word_index * WORD_BITS + bit;
+                free &= free - 1;
+                if self.claim_and_publish(index, priority, data) {
+                    self.search_hint.store((index + 1) % capacity, Ordering::Relaxed);
+                    return STATUS_OK;
                 }
-                slot.priority.store(priority, Ordering::Relaxed);
-                slot.length.store(data.len(), Ordering::Relaxed);
-                slot.state.store(SLOT_PUBLISHED, Ordering::Release);
+            }
+        }
+
+        // Metadata is only an index and may lag a concurrent reclaim. The
+        // authoritative fallback preserves exact FULL behavior.
+        for index in 0..capacity {
+            if self.claim_and_publish(index, priority, data) {
+                self.search_hint.store((index + 1) % capacity, Ordering::Relaxed);
                 return STATUS_OK;
             }
         }
         STATUS_FULL
     }
+
+    #[inline]
+    fn claim_and_publish(&self, index: usize, priority: u64, data: &[u8]) -> bool {
+        let slot = &self.state.slots[index];
+        if slot
+            .state
+            .compare_exchange(SLOT_EMPTY, SLOT_WRITING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        unsafe {
+            (&mut *slot.value.get())[..data.len()].copy_from_slice(data);
+        }
+        slot.priority.store(priority, Ordering::Relaxed);
+        slot.length.store(data.len(), Ordering::Relaxed);
+        // Publish the search bit before the state release. A consumer that
+        // observes the bit but not publication simply falls back/retries.
+        self.state.occupied[index / WORD_BITS].fetch_or(
+            1usize << (index % WORD_BITS),
+            Ordering::Release,
+        );
+        slot.state.store(SLOT_PUBLISHED, Ordering::Release);
+        true
+    }
 }
 
 pub struct Consumer {
     state: Arc<QueueState>,
+    search_hint: AtomicUsize,
 }
 
 impl Consumer {
@@ -150,12 +198,47 @@ impl Consumer {
         loop {
             let mut best: Option<&Slot> = None;
             let mut best_priority = u64::MAX;
-            for slot in &self.state.slots {
-                if slot.state.load(Ordering::Acquire) == SLOT_PUBLISHED {
-                    let priority = slot.priority.load(Ordering::Relaxed);
-                    if best.is_none() || priority < best_priority {
-                        best = Some(slot);
-                        best_priority = priority;
+            let mut best_index = 0;
+
+            let capacity = self.state.slots.len();
+            let start = self.search_hint.load(Ordering::Relaxed) % capacity;
+            let start_word = start / WORD_BITS;
+            for word_offset in 0..self.state.occupied.len() {
+                let word_index = (start_word + word_offset) % self.state.occupied.len();
+                let valid = valid_word_mask(word_index, capacity);
+                let mut bits = self.state.occupied[word_index].load(Ordering::Acquire) & valid;
+                while bits != 0 {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let slot = &self.state.slots[word_index * WORD_BITS + bit];
+                    if slot.state.load(Ordering::Acquire) == SLOT_PUBLISHED {
+                        let priority = slot.priority.load(Ordering::Relaxed);
+                        if best.is_none() || priority < best_priority {
+                            best = Some(slot);
+                            best_priority = priority;
+                            best_index = word_index * WORD_BITS + bit;
+                        }
+                    }
+                }
+            }
+
+            // A publication can race the bitmap read, and a reclaimed bit
+            // can remain set briefly. Scan authoritative states when the
+            // indexed view found no published item (or only found holes).
+            if best.is_none() {
+                for slot in &self.state.slots {
+                    if slot.state.load(Ordering::Acquire) == SLOT_PUBLISHED {
+                        let priority = slot.priority.load(Ordering::Relaxed);
+                        if best.is_none() || priority < best_priority {
+                            best = Some(slot);
+                            best_priority = priority;
+                            best_index = self
+                                .state
+                                .slots
+                                .iter()
+                                .position(|candidate| std::ptr::eq(candidate, slot))
+                                .expect("selected slot belongs to queue");
+                        }
                     }
                 }
             }
@@ -185,9 +268,27 @@ impl Consumer {
             unsafe {
                 output[..length].copy_from_slice(&(&*slot.value.get())[..length]);
             }
+            let index = best_index;
+            self.state.occupied[index / WORD_BITS].fetch_and(
+                !(1usize << (index % WORD_BITS)),
+                Ordering::AcqRel,
+            );
             slot.state.store(SLOT_EMPTY, Ordering::Release);
+            self.search_hint.store((index + 1) % capacity, Ordering::Relaxed);
             return Ok(length);
         }
+    }
+}
+
+#[inline]
+fn valid_word_mask(word_index: usize, capacity: usize) -> usize {
+    let remaining = capacity.saturating_sub(word_index * WORD_BITS);
+    if remaining >= WORD_BITS {
+        usize::MAX
+    } else if remaining == 0 {
+        0
+    } else {
+        (1usize << remaining) - 1
     }
 }
 
@@ -227,5 +328,89 @@ mod tests {
         let mut full_output = [0_u8; 8];
         assert_eq!(consumer.try_dequeue(&mut full_output), Ok(7));
         assert_eq!(&full_output[..7], b"payload");
+    }
+
+    #[test]
+    fn concurrent_consumers_conserve_items() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let queue = Queue::new(8, 64, 2, 2).unwrap();
+        let producer = queue.producer(0).unwrap();
+        let first = queue.consumer(0).unwrap();
+        let second = queue.consumer(1).unwrap();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                for sequence in 0..2_000u64 {
+                    let value = sequence.to_le_bytes();
+                    while producer.try_enqueue(sequence, &value) == STATUS_FULL {
+                        thread::yield_now();
+                    }
+                }
+            });
+            for consumer in [first, second] {
+                let consumed = Arc::clone(&consumed);
+                scope.spawn(move || {
+                    let mut output = [0u8; 8];
+                    while consumed.load(AtomicOrdering::Acquire) < 2_000 {
+                        if consumer.try_dequeue(&mut output).is_ok() {
+                            consumed.fetch_add(1, AtomicOrdering::Release);
+                        } else {
+                            thread::yield_now();
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(consumed.load(AtomicOrdering::Acquire), 2_000);
+    }
+
+    #[test]
+    fn concurrent_undersized_consumer_does_not_block_other_consumer() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let queue = Queue::new(8, 64, 1, 2).unwrap();
+        let producer = queue.producer(0).unwrap();
+        let short = queue.consumer(0).unwrap();
+        let full = queue.consumer(1).unwrap();
+        let consumed = Arc::new(AtomicUsize::new(0));
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                for sequence in 0..2_000u64 {
+                    let length = if sequence % 2 == 0 { 16 } else { 64 };
+                    let value = vec![sequence as u8; length];
+                    while producer.try_enqueue(sequence, &value) == STATUS_FULL {
+                        thread::yield_now();
+                    }
+                }
+            });
+            let consumed_short = Arc::clone(&consumed);
+            scope.spawn(move || {
+                let mut output = [0xa7u8; 32];
+                while consumed_short.load(AtomicOrdering::Acquire) < 2_000 {
+                    if short.try_dequeue(&mut output).is_ok() {
+                        consumed_short.fetch_add(1, AtomicOrdering::Release);
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            });
+            let consumed_full = Arc::clone(&consumed);
+            scope.spawn(move || {
+                let mut output = [0u8; 64];
+                while consumed_full.load(AtomicOrdering::Acquire) < 2_000 {
+                    if full.try_dequeue(&mut output).is_ok() {
+                        consumed_full.fetch_add(1, AtomicOrdering::Release);
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            });
+        });
+        assert_eq!(consumed.load(AtomicOrdering::Acquire), 2_000);
     }
 }

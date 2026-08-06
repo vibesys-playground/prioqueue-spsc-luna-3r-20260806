@@ -68,7 +68,7 @@ acceptance"); read it before parking or abandoning.
 
 ## Major
 
-1. **Lock-free SPSC ownership-transfer queue** — `in_progress` (round 1). Replace
+1. **Lock-free SPSC ownership-transfer queue** — `done` (round 1). Replaced
    the contended `Mutex<BinaryHeap>` baseline with preallocated bounded slots,
    atomic producer/consumer ownership handoff, and a consumer-side minimum
    priority selection path; this targets lock acquisition, heap maintenance,
@@ -77,7 +77,7 @@ acceptance"); read it before parking or abandoning.
    allocation overhead across the benchmark's 8-byte to 1 MiB values while
    retaining dynamic runner-supplied limits; this targets the end-to-end cost
    that remains after synchronization is removed.
-3. **Priority-selection specialization** — `todo`. Tune the minimum-priority
+3. **Priority-selection specialization** — `in_progress` (round 2). Tune the minimum-priority
    lookup for the actual bounded capacities and priority stream, including
    metadata/layout changes if profiling shows scans dominate; this targets the
    queue's unavoidable ordering work.
@@ -88,12 +88,14 @@ acceptance"); read it before parking or abandoning.
 
 ## Minor
 
-1. **Baseline contract gate** — `todo`. A small correctness/build verification
+1. **Baseline contract gate** — `done`. A small correctness/build verification
    slice needed whenever the queue representation changes (blocks Major 1).
 
 ## Done
 
-(none yet)
+- Lock-free SPSC ownership-transfer queue (round 1): correctness and native
+  benchmark passed; baseline reached 620688 end-to-end ops/s.
+- Baseline contract gate (round 1): ABI, native probes, and accuracy gate passed.
 
 ## Parked
 
