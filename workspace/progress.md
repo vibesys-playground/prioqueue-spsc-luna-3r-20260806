@@ -195,3 +195,10 @@ The candidate builds successfully as priority-queue-candidate.so and passes Rust
 ### Feedback
 
 
+## Round 2 — Framework accuracy gate (attempt 2)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . check --workspace ../.. --scenario spsc --operations 32 --trials 100`
+
+### Output
+PASS - spsc linearizable bounded priority queue (100 trials, approximately 32 ops/trial, 1P/1C, capacity=1024, value_size=8)
+
