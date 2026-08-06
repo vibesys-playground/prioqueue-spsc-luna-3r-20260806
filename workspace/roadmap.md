@@ -73,11 +73,8 @@ acceptance"); read it before parking or abandoning.
    atomic producer/consumer ownership handoff, and a consumer-side minimum
    priority selection path; this targets lock acquisition, heap maintenance,
    and enqueue allocation in the measured SPSC hot path.
-2. **Copy-path and storage-layout tuning** — `todo`. Reduce byte-copy and
-   allocation overhead across the benchmark's 8-byte to 1 MiB values while
-   retaining dynamic runner-supplied limits; this targets the end-to-end cost
-   that remains after synchronization is removed.
-3. **Priority-selection specialization** — `in_progress` (round 2). Tune the minimum-priority
+2. **Copy-path and storage-layout tuning** — `in_progress` (round 3). Reduce per-operation byte-copy overhead and unnecessary buffer representation work across the benchmark's 8-byte to 1 MiB values while retaining dynamic runner-supplied limits; this targets the end-to-end cost that remains after synchronization and full scans are removed.
+3. **Priority-selection specialization** — `done` (round 2). Tune the minimum-priority
    lookup for the actual bounded capacities and priority stream, including
    metadata/layout changes if profiling shows scans dominate; this targets the
    queue's unavoidable ordering work.
@@ -96,6 +93,7 @@ acceptance"); read it before parking or abandoning.
 - Lock-free SPSC ownership-transfer queue (round 1): correctness and native
   benchmark passed; baseline reached 620688 end-to-end ops/s.
 - Baseline contract gate (round 1): ABI, native probes, and accuracy gate passed.
+- Priority-selection specialization (round 2): exact SPSC publication/free-index exchange plus consumer-local priority heap removed repeated full-capacity scans; trusted benchmark reached 3.41M total_ops_per_sec and accuracy passed.
 
 ## Parked
 

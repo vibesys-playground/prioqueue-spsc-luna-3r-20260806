@@ -2,9 +2,11 @@
 
 mod ffi;
 
+use std::alloc::{alloc, dealloc, Layout};
 use std::cell::UnsafeCell;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::BinaryHeap;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -25,29 +27,36 @@ struct Slot {
     state: AtomicU8,
     priority: AtomicU64,
     length: AtomicUsize,
-    value: UnsafeCell<Vec<u8>>,
+    // The buffer is allocated once with exactly the runner-supplied bound.
+    // Keeping only the pointer and bound avoids Vec metadata and permits a
+    // direct bounded non-overlapping copy in the operation path.
+    value: NonNull<u8>,
+    value_layout: Layout,
 }
 
-// A slot's Vec is accessed by only the owner of its current state. The state
-// release/acquire transitions publish all value-buffer accesses between the
-// producer and consumer.
+// A slot's raw buffer is accessed by only the owner of its current state. The
+// state release/acquire transitions publish all value-buffer accesses between
+// the producer and consumer.
+unsafe impl Send for Slot {}
 unsafe impl Sync for Slot {}
 
 impl Slot {
     fn new(max_value_size: usize) -> Result<Self, u32> {
-        let mut value = Vec::new();
-        value
-            .try_reserve_exact(max_value_size)
-            .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        // The buffer is deliberately allocated once. Bytes beyond length are
-        // never read, so they need not be initialized.
-        unsafe { value.set_len(max_value_size) };
+        let value_layout = Layout::array::<u8>(max_value_size).map_err(|_| STATUS_INVALID)?;
+        let value = NonNull::new(unsafe { alloc(value_layout) }).ok_or(STATUS_INTERNAL_ERROR)?;
         Ok(Self {
             state: AtomicU8::new(SLOT_EMPTY),
             priority: AtomicU64::new(0),
             length: AtomicUsize::new(0),
-            value: UnsafeCell::new(value),
+            value,
+            value_layout,
         })
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.value.as_ptr(), self.value_layout) };
     }
 }
 
@@ -256,9 +265,7 @@ impl Producer {
             self.state.ring_mode.store(0, Ordering::Release);
             return None;
         }
-        unsafe {
-            (&mut *slot.value.get())[..data.len()].copy_from_slice(data);
-        }
+        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), slot.value.as_ptr(), data.len()) };
         slot.priority.store(priority, Ordering::Relaxed);
         slot.length.store(data.len(), Ordering::Relaxed);
         self.state.occupied[index / WORD_BITS].fetch_or(
@@ -294,9 +301,7 @@ impl Producer {
             self.state.ring_mode.store(0, Ordering::Release);
             return None;
         }
-        unsafe {
-            (&mut *slot.value.get())[..data.len()].copy_from_slice(data);
-        }
+        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), slot.value.as_ptr(), data.len()) };
         slot.priority.store(priority, Ordering::Relaxed);
         slot.length.store(data.len(), Ordering::Relaxed);
         self.state.occupied[index / WORD_BITS].fetch_or(
@@ -320,9 +325,7 @@ impl Producer {
         {
             return false;
         }
-        unsafe {
-            (&mut *slot.value.get())[..data.len()].copy_from_slice(data);
-        }
+        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), slot.value.as_ptr(), data.len()) };
         slot.priority.store(priority, Ordering::Relaxed);
         slot.length.store(data.len(), Ordering::Relaxed);
         // Publish the search bit before the state release. A consumer that
@@ -401,9 +404,7 @@ impl Consumer {
             return None;
         }
         let item = heap.pop().expect("heap item was peeked");
-        unsafe {
-            output[..length].copy_from_slice(&(&*slot.value.get())[..length]);
-        }
+        unsafe { ptr::copy_nonoverlapping(slot.value.as_ptr(), output.as_mut_ptr(), length) };
         self.state.occupied[item.index / WORD_BITS].fetch_and(
             !(1usize << (item.index % WORD_BITS)),
             Ordering::AcqRel,
@@ -480,9 +481,7 @@ impl Consumer {
         {
             return Some(Err(STATUS_EMPTY));
         }
-        unsafe {
-            output[..length].copy_from_slice(&(&*slot.value.get())[..length]);
-        }
+        unsafe { ptr::copy_nonoverlapping(slot.value.as_ptr(), output.as_mut_ptr(), length) };
         self.state.occupied[index / WORD_BITS].fetch_and(
             !(1usize << (index % WORD_BITS)),
             Ordering::AcqRel,
@@ -571,9 +570,7 @@ impl Consumer {
                 // retrying is finite, non-blocking progress for the caller.
                 continue;
             }
-            unsafe {
-                output[..length].copy_from_slice(&(&*slot.value.get())[..length]);
-            }
+            unsafe { ptr::copy_nonoverlapping(slot.value.as_ptr(), output.as_mut_ptr(), length) };
             let index = best_index;
             self.state.occupied[index / WORD_BITS].fetch_and(
                 !(1usize << (index % WORD_BITS)),
