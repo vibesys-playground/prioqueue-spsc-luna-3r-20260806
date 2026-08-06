@@ -65,3 +65,10 @@ The candidate builds successfully as a native shared library and exports every r
 ### Feedback
 
 
+## Round 1 — Framework accuracy gate (attempt 1)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . check --workspace ../.. --scenario spsc --operations 32 --trials 100`
+
+### Output
+PASS - spsc linearizable bounded priority queue (100 trials, approximately 32 ops/trial, 1P/1C, capacity=1024, value_size=8)
+
