@@ -293,3 +293,38 @@ The library builds successfully, exports the required vspq ABI symbols, and all 
 ### Output
 PASS - spsc linearizable bounded priority queue (100 trials, approximately 32 ops/trial, 1P/1C, capacity=1024, value_size=8)
 
+## Round 3 — Framework benchmark (attempt 1)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario spsc --repetitions 3`
+- **total_ops_per_sec**: 3547475.560983
+
+### Output
+Scenario: spsc  Repetitions: 3  Median successful ops/s: 3547476
+  Samples: [4.551836202221e+06 3.547475560983e+06 2.907255346804e+06]
+Scenario: spsc  Duration: 10.000s  Prod: 1  Cons: 1
+  Enqueued: 17738155  Full: 36014165  Dequeued: 17737131  Empty: 268117
+  Successful: 35475286  Attempts: 71757568 (3547476 successful ops/s)
+
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON__
+[
+  {
+    "scenario": "spsc",
+    "enqueued": 17738155,
+    "dropped": 36014165,
+    "dequeued": 17737131,
+    "empty": 268117,
+    "attempts": 71757568,
+    "duration": 10.000149512,
+    "total_ops_per_sec": 3547475.560983,
+    "producers": 1,
+    "consumers": 1,
+    "repetitions": 3,
+    "total_ops_per_sec_samples": [
+      4551836.202221,
+      3547475.560983,
+      2907255.346804
+    ]
+  }
+]
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
