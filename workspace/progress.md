@@ -202,3 +202,38 @@ The candidate builds successfully as priority-queue-candidate.so and passes Rust
 ### Output
 PASS - spsc linearizable bounded priority queue (100 trials, approximately 32 ops/trial, 1P/1C, capacity=1024, value_size=8)
 
+## Round 2 — Framework benchmark (attempt 2)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario spsc --repetitions 3`
+- **total_ops_per_sec**: 3411211.706248
+
+### Output
+Scenario: spsc  Repetitions: 3  Median successful ops/s: 3411212
+  Samples: [3.381645317731e+06 5.296994744613e+06 3.411211706248e+06]
+Scenario: spsc  Duration: 10.000s  Prod: 1  Cons: 1
+  Enqueued: 17056897  Full: 50118847  Dequeued: 17055911  Empty: 2009
+  Successful: 34112808  Attempts: 84233664 (3411212 successful ops/s)
+
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON__
+[
+  {
+    "scenario": "spsc",
+    "enqueued": 17056897,
+    "dropped": 50118847,
+    "dequeued": 17055911,
+    "empty": 2009,
+    "attempts": 84233664,
+    "duration": 10.000202549,
+    "total_ops_per_sec": 3411211.706248,
+    "producers": 1,
+    "consumers": 1,
+    "repetitions": 3,
+    "total_ops_per_sec_samples": [
+      3381645.317731,
+      5296994.744613,
+      3411211.706248
+    ]
+  }
+]
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
