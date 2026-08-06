@@ -72,3 +72,38 @@ The candidate builds successfully as a native shared library and exports every r
 ### Output
 PASS - spsc linearizable bounded priority queue (100 trials, approximately 32 ops/trial, 1P/1C, capacity=1024, value_size=8)
 
+## Round 1 — Framework benchmark (attempt 1)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario spsc --repetitions 3`
+- **total_ops_per_sec**: 620687.981394
+
+### Output
+Scenario: spsc  Repetitions: 3  Median successful ops/s: 620688
+  Samples: [723380.509595 620687.981394 335287.888487]
+Scenario: spsc  Duration: 10.000s  Prod: 1  Cons: 1
+  Enqueued: 3103552  Full: 0  Dequeued: 3103486  Empty: 7170
+  Successful: 6207038  Attempts: 6214208 (620688 successful ops/s)
+
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON__
+[
+  {
+    "scenario": "spsc",
+    "enqueued": 3103552,
+    "dropped": 0,
+    "dequeued": 3103486,
+    "empty": 7170,
+    "attempts": 6214208,
+    "duration": 10.000254856,
+    "total_ops_per_sec": 620687.981394,
+    "producers": 1,
+    "consumers": 1,
+    "repetitions": 3,
+    "total_ops_per_sec_samples": [
+      723380.509595,
+      620687.981394,
+      335287.888487
+    ]
+  }
+]
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
