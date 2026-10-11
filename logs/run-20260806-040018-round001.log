@@ -1,0 +1,266 @@
+
+============================================================
+  Round 1/1
+============================================================
+
+
+=== Orchestrator ROUND START: round-1-plan ===
+backend: cli, provider: codex, model: gpt-5.6-luna, cwd: /home/rairai77/vibe-serve/exp_env/20260806-040018-287147-e969b180-prioqueue-spsc-luna-56/workspace
+--- input ---
+You are the Orchestrator agent in an autonomous optimization loop. Your sole output is a plan for this round — you do NOT write or modify any code.
+
+## Objective
+
+Optimize a single-producer, single-consumer bounded priority queue.
+
+Headline metric: `total_ops_per_sec` (maximize).
+
+Preserve the required interface:
+- Provide a native shared library named `./priority-queue-candidate.so`.
+- Export the copying C ABI documented in
+  `_evaluator/priority-queue/CANDIDATE_CONTRACT.md`.
+- Implement prioritized enqueue and dequeue for copied byte values using the
+  capacity and value size supplied by the trusted runner.
+
+The candidate may use any language or combination of languages. The queue must
+remain linearizable, return lower numeric priorities first, never fabricate or
+duplicate items, and respect capacity. Items with equal priority may be returned
+in any order. Maximize trusted end-to-end operation throughput for the SPSC
+workload.
+
+Start from the editable Rust implementation in `src/lib.rs`. It is an
+intentionally naive correctness baseline, not part of the trusted evaluator.
+
+
+## Workspace state
+
+- Workspace is version-tracked with git; every previous round has a commit.
+
+
+## Progress so far
+
+Read `progress.md` in your working directory for the full history. The most recent entries matter most. You may also Read / Grep the workspace to inspect current code state.
+
+## Roadmap (your strategic memory across rounds)
+
+You own a free-form markdown file at `roadmap.md` in your working directory. The framework reseeds it on a fresh run, then reads it back into this prompt every round and otherwise leaves it alone. Use the Read/Edit/Write tools to keep it current.
+
+**The roadmap is what stops this loop from falling into local optima.** Without it, every round you'd re-derive "what should we do next?" from progress.md and react to the most recent setback. With it, you commit publicly to a multi-round arc; flipping a Major's status (especially to `abandoned`) requires explicit deliberate action with a written justification — the rules below force that decision to be deliberate rather than a quiet drift toward whatever the latest profiler line suggests.
+
+### Major statuses — `parked` vs `abandoned`
+
+These are not the same thing. Treating them as one bucket is the loop's most common failure mode, because it conflates "this technique has a bug" with "this technique doesn't fit". Use them precisely:
+
+- **`parked`** — implementation appears buggy or incomplete (e.g. wired but acceptance is zero, capture succeeds but never replays, fallback path always triggers), but the *direction* is still believable. Returnable to `in_progress`. This is the right call when the metric isn't moving for an *implementation* reason.
+- **`abandoned`** — the *direction itself* is wrong for this workload. Strict requirement: the autopsy must name a **code-level or hardware-level mechanism** explaining why the technique cannot help *here*, not a behavioral perf observation. A perf delta ("0% improvement", "0 acceptance") is not a mechanism. If you can't write a mechanism, the right status is **`parked`**, not `abandoned`.
+
+If you're tempted to abandon because an implementation never activates, always falls back, or produces no improvement, first treat that as a debugging signal: inspect the code path, objective, and domain references, then either fix it or park it. Don't abandon without a mechanism-level reason.
+
+Required this round, in order:
+
+1. **Read `roadmap.md`.**
+2. **Update it** to reflect: progress on the active item, any newly discovered Major work, and statuses (`todo` / `in_progress` / `done` / `parked` / `abandoned`) that have changed (see the rules above for `parked` vs `abandoned`). If it's nearly empty (fresh run), populate it now with a 3-5 item Major list derived from the objective.
+3. **Pick the active Major item** the round will serve. Your `task` must implement (a slice of) it. If you genuinely need a Minor first because it blocks the Major, say so in your reasoning and tag the Minor "blocks: <major-id>".
+4. After updating, write the same plan into `progress.md` via the normal append path (the framework will record your structured response there too).
+
+### Current `roadmap.md` contents
+
+```
+# Roadmap
+
+You (the Orchestrator) own this file end-to-end. Update it every round
+*before* deciding the round's task. The framework reads it back into
+your next prompt — it does not parse it, so format it however you find
+useful, but follow these conventions so the structure stays legible:
+
+- **Major** items: structural changes expected to move the headline
+  performance metric meaningfully (e.g. "Implement EAGLE3 speculative
+  decoding", "Add CUDA graphs to verifier decode", "Replace manual
+  attention with FlashAttention"). Usually 1-3 rounds each.
+- **Minor** items: bug fixes, polish, gates (correctness recoveries,
+  tiny kernel swaps, accuracy bumps). Usually 1 round each.
+- Use one of these four statuses, and note rounds spent on each
+  in-progress item:
+  - `todo` — not started.
+  - `in_progress` — actively being worked on this round (or recent rounds).
+  - `done` — implemented, profiler-verified, hitting (close to) predicted impact.
+  - `parked` — implementation is buggy or incomplete, but you believe the
+    *direction* is sound. Returnable to `in_progress` later. Use this when
+    the metric isn't moving for an *implementation* reason (zero acceptance
+    on EAGLE3, capture failures on CUDA graphs, …) rather than a workload
+    reason.
+  - `abandoned` — the *direction* itself doesn't fit this workload. Strict
+    requirement (see below) before flipping to this state.
+- For each item include a one-line *why* (predicted impact, what
+  bottleneck it addresses).
+
+If any Major item is `todo` or `in_progress`, this round's task should
+serve it. Do NOT drop into Minor work while a Major sits unfinished
+unless that Minor is genuinely blocking the Major (state the dependency
+explicitly when you do).
+
+## `parked` vs `abandoned` — get this distinction right
+
+These two are not the same thing and the loop's behavior degrades if you
+treat them as one bucket:
+
+- **`parked`** is the right call when (a) you predicted the technique
+  would help, (b) the implementation passes the judge / pytest / accuracy
+  gate, but (c) the headline metric didn't move *because the implementation
+  appears to have a bug or is incomplete*. Symptoms: zero acceptance on a
+  speculative decoder, all-fallback paths on what should be the fast path,
+  a CUDA graph capturing but never replaying, etc. The direction itself is
+  still believable; you just couldn't make the implementation good enough
+  in the rounds you spent. Mark `parked` and move to a different Major;
+  return to it when (i) you have a hypothesis for the bug, or (ii) other
+  levers are exhausted.
+
+- **`abandoned`** is the right call only when the *direction itself* is
+  the wrong fit for this workload. Examples: continuous batching on a
+  workload contractually limited to single-batch, MTP on a model that
+  doesn't ship MTP heads, paged attention when the engine's fixed-shape
+  KV path is already optimal at this batch size. Each requires a
+  *mechanism-level* autopsy explaining why the technique cannot help
+  *here* (not "it didn't pay off in 3 rounds"). If you can't write that
+  mechanism, the right status is `parked`, not `abandoned`.
+
+**Hard rule for `abandoned` autopsies:** you must name a code-level or
+hardware-level mechanism — not a behavioral observation. A perf number
+("+0% TPOT") is not a mechanism; "the workload is single-batch by
+contract so continuous batching cannot raise arithmetic intensity" is.
+If acceptance on a speculative decoder is zero, that is *not* a reason
+to abandon — it's a debugging task, and the right status is `parked`
+with a hypothesis. Spec decode acceptance debugging has a checklist in
+`references/algorithms/speculative-decoding.md` ("Debugging 0
+acceptance"); read it before parking or abandoning.
+
+## Major
+
+(populate on round 1 based on the objective)
+
+## Minor
+
+(none yet)
+
+## Done
+
+(none yet)
+
+## Parked
+
+(none yet)
+
+## Abandoned
+
+(none yet)
+
+```
+
+
+## Skills
+
+A library of curated technique-specific skills may be installed in your working directory. Your CLI's native skill mechanism exposes their names + short descriptions; activate (open) only the ones whose description matches the work this round needs. Don't try to enumerate or preload them.
+
+
+
+
+## Task granularity
+
+Tasks should be one concrete implementation slice, small enough for the implementer to finish and the judge to verify in one round. Examples:
+- "Build the first minimal correct implementation for the target contract."
+- "Replace the identified hot path with a lower-overhead implementation."
+- "Add a benchmark-visible fast path for the active workload shape."
+- "Fix the correctness failure reported by the previous judge attempt."
+
+## Scoping interface work
+
+The implementer and judge templates intentionally do NOT hardcode the full interface surface. When your task touches an API, class contract, protocol, file format, or message schema, name the specific part in scope and point the implementer at the authoritative domain reference. The implementer is told to implement ONLY what you name; the judge is told to verify ONLY what your `pass_criteria` mentions.
+
+## Pass criteria
+
+Criteria must be specific and testable. The framework ALWAYS runs the accuracy checker and a benchmark sanity check, so you only need to specify feature-level criteria. Do NOT list interface surfaces you do not want the judge to verify this round.
+
+**Runtime-environment notes are authoritative.** When the runtime-environment block above states a framework-level fact (decorator name, volume-name normalization rule, required entry-point names, namespace-prefix conventions, supported keyword arguments), that fact is **the truth for this round** even if a previous round's judge feedback or implementer summary in `progress.md` says something different. Prior feedback can be stale because the framework's own runtime contract evolved between rounds; do not propagate stale framework-level demands into this round's `pass_criteria`. If you spot a conflict between a prior judge demand and the runtime-environment block, drop the prior demand and write the criterion in terms of what the runtime-environment block says today.
+
+**Performance criteria use the objective's headline metric, end-to-end.** Whatever metric the OBJECTIVE specifies (single-batch tok/s, aggregate throughput, TTFT, p50/p99 latency, …) is the one the framework's plateau detector compares across rounds and the one your `pass_criteria` should reference for any performance gate. Always express it as the benchmark measures it end-to-end — never as a per-call, per-replay, or per-kernel timing.
+
+Avoid pass criteria that use an internal microbenchmark as a proxy for the objective unless the objective explicitly names that microbenchmark. A local timing can miss end-to-end effects that determine the real score. Phrase performance gates on the headline metric whenever possible, and use internal timings only as supporting diagnostic evidence.
+
+**Scope static-inspection clauses to implementer-authored files.** When you write a "no X in the code" criterion, name the file path you mean — typically `main.py` or modules the implementer authored. Phrasings like "no profiler code" or "no benchmark code" are over-broad: the workspace contains framework-provided input/helper files (`benchmark/`, `accuracy_checker/`, `nsys_profiler/`, `torch_profiler/`, `reference/`, `skills/`, and manifest command wrappers) that the implementer can't delete and that legitimately contain the very keywords you'd grep for. Prefer wordings like:
+
+- ✅ "no `<forbidden helper>` invocations in `main.py` or any module the implementer added"
+- ✅ "no benchmark-specific shortcut branch in the candidate implementation"
+- ❌ "no profiler code" (will trip on `nsys_profiler/server.py` and burn rounds in retry loops)
+- ❌ "no benchmark code" (will trip on the framework-provided benchmark harness)
+
+This was a real failure mode in earlier runs: an over-broad "no profiler code" clause caused the judge to demand deletion of the framework's read-only profiler mount, which the implementer cannot remove, exhausting the retry budget and forcing a packaging workaround the next round.
+
+## No early termination
+
+There is **no** early-stop signal — every round must propose a real task. If you feel "further work would add no value", that's the signal you've stopped hunting for wins prematurely; go back to the objective, profile, roadmap, and domain references to pick the next lever you haven't visited.
+
+## Output
+
+Return exactly one JSON object. Do not wrap in markdown fences.
+
+{ "task": "<implementer task description>", "pass_criteria": "<feature-level criteria for the judge>", "revert_to_round": <integer or null>, "reasoning": "<short explanation of your reasoning>" }
+
+
+Produce this round's plan. Return only the JSON object.
+
+--
+Return EXACTLY one JSON object that conforms to the schema below. Do not wrap it in markdown fences. Do not include any extra prose before or after the JSON object.
+
+Schema for OrchestratorPlan:
+{
+  "description": "The per-round plan produced by the orchestrator.\n\nThe framework applies the plan in this order: optional\n``revert_to_round`` git checkout, then implementer with ``task``,\nthen judge with ``pass_criteria``. The loop always runs the full\n``max_rounds`` budget; there is no early-stop signal from the\norchestrator.",
+  "properties": {
+    "task": {
+      "description": "Well-scoped task description handed to the implementer.",
+      "title": "Task",
+      "type": "string"
+    },
+    "pass_criteria": {
+      "description": "Feature-level pass criteria for the judge. The framework always runs the accuracy checker and benchmark sanity in addition.",
+      "title": "Pass Criteria",
+      "type": "string"
+    },
+    "revert_to_round": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional round number to roll back the workspace to (via git checkout of that round's commit) before the implementer runs.",
+      "title": "Revert To Round"
+    },
+    "reasoning": {
+      "description": "Short explanation of the orchestrator's reasoning for this round.",
+      "title": "Reasoning",
+      "type": "string"
+    }
+  },
+  "required": [
+    "task",
+    "pass_criteria",
+    "reasoning"
+  ],
+  "title": "OrchestratorPlan",
+  "type": "object"
+}
+
+[Round 1/1 | Orchestrator | 0.4s | 0/400k] [codex stderr] Traceback (most recent call last):
+[Round 1/1 | Orchestrator | 0.4s | 0/400k] [codex stderr]   File "/usr/local/bin/bwrap", line 5, in <module>
+[Round 1/1 | Orchestrator | 0.4s | 0/400k] [codex stderr]     from bwrap.core import main
+[Round 1/1 | Orchestrator | 0.4s | 0/400k] [codex stderr] ModuleNotFoundError: No module named 'bwrap.core'
+
+=== Orchestrator ROUND ERROR: round-1-plan ===
+RuntimeError: codex exited with code 1: Traceback (most recent call last):
+  File "/usr/local/bin/bwrap", line 5, in <module>
+    from bwrap.core import main
+ModuleNotFoundError: No module named 'bwrap.core'
+

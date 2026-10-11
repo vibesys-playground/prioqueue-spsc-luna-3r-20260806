@@ -1,0 +1,3 @@
+[log] orchestrate run: /home/rairai77/vibe-serve/exp_env/20260806-040018-287147-e969b180-prioqueue-spsc-luna-56/logs/run-20260806-040154.log
+[log] experiment root: /home/rairai77/vibe-serve/exp_env/20260806-040018-287147-e969b180-prioqueue-spsc-luna-56
+[log] objective: Optimize a single-producer, single-consumer bounded priority queue.
